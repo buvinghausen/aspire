@@ -30,7 +30,7 @@ internal sealed class AzureResourcePreparer(
         }
 
         var options = provisioningOptions.Value;
-        if (!options.SupportsTargetedRoleAssignments)
+        if (!EnvironmentSupportsTargetedRoleAssignments(options))
         {
             // If the app infrastructure does not support targeted role assignments, then we need to ensure that
             // there are no role assignment annotations in the app model because they won't be honored otherwise.
@@ -79,6 +79,13 @@ internal sealed class AzureResourcePreparer(
         return azureResources;
     }
 
+    private bool EnvironmentSupportsTargetedRoleAssignments(AzureProvisioningOptions options)
+    {
+        // run mode always supports targeted role assignments
+        // publish mode only supports targeted role assignments if the environment supports it
+        return executionContext.IsRunMode || options.SupportsTargetedRoleAssignments;
+    }
+
     private static void EnsureNoRoleAssignmentAnnotations(DistributedApplicationModel appModel)
     {
         foreach (var resource in appModel.Resources)
@@ -94,7 +101,7 @@ internal sealed class AzureResourcePreparer(
     {
         var globalRoleAssignments = new Dictionary<AzureProvisioningResource, HashSet<RoleDefinition>>();
 
-        if (!options.SupportsTargetedRoleAssignments)
+        if (!EnvironmentSupportsTargetedRoleAssignments(options))
         {
             // when the app infrastructure doesn't support targeted role assignments, just copy all the default role assignments to applied role assignments
             foreach (var resource in azureResources.Select(r => r.AzureResource).OfType<AzureProvisioningResource>())
@@ -123,7 +130,7 @@ internal sealed class AzureResourcePreparer(
                     continue;
                 }
 
-                if (!resource.IsContainer() && resource is not ProjectResource)
+                if (!IsResourceValidForRoleAssignments(resource))
                 {
                     continue;
                 }
@@ -172,14 +179,30 @@ internal sealed class AzureResourcePreparer(
                     {
                         var (identityResource, roleAssignmentResources) = CreateIdentityAndRoleAssignmentResources(options, resource, roleAssignments);
 
-                        // attach the identity resource to compute resource so it can be used by the compute environment
-                        resource.Annotations.Add(new AppIdentityAnnotation(identityResource));
-
-                        appModel.Resources.Add(identityResource);
+                        if (resource != identityResource)
+                        {
+                            // attach the identity resource to compute resource so it can be used by the compute environment
+                            resource.Annotations.Add(new AppIdentityAnnotation(identityResource));
+                            // add the identity resource to the resource collection so it can be provisioned
+                            appModel.Resources.Add(identityResource);
+                        }
                         foreach (var roleAssignmentResource in roleAssignmentResources)
                         {
                             appModel.Resources.Add(roleAssignmentResource);
                         }
+                    }
+                }
+            }
+
+            if (executionContext.IsRunMode)
+            {
+                // in RunMode, any Azure resources that are not referenced by a compute resource should have their default role assignments applied
+                foreach (var azureResource in azureResources.Select(r => r.AzureResource).OfType<AzureProvisioningResource>())
+                {
+                    if (!globalRoleAssignments.TryGetValue(azureResource, out _) &&
+                        azureResource.TryGetLastAnnotation<DefaultRoleAssignmentsAnnotation>(out var defaultRoleAssignments))
+                    {
+                        AppendGlobalRoleAssignments(globalRoleAssignments, azureResource, defaultRoleAssignments.Roles);
                     }
                 }
             }
@@ -188,6 +211,13 @@ internal sealed class AzureResourcePreparer(
         if (globalRoleAssignments.Count > 0)
         {
             await CreateGlobalRoleAssignments(appModel, globalRoleAssignments, options).ConfigureAwait(false);
+        }
+
+        // We can derive role assignments for compute resources and declared
+        // AzureUserAssignedIdentityResources
+        static bool IsResourceValidForRoleAssignments(IResource resource)
+        {
+            return resource.IsContainer() || resource is ProjectResource || resource is AzureUserAssignedIdentityResource;
         }
     }
 
@@ -204,15 +234,17 @@ internal sealed class AzureResourcePreparer(
         return result;
     }
 
-    private static (AppIdentityResource IdentityResource, List<AzureBicepResource> RoleAssignmentResources) CreateIdentityAndRoleAssignmentResources(
+    private static (AzureUserAssignedIdentityResource IdentityResource, List<AzureBicepResource> RoleAssignmentResources) CreateIdentityAndRoleAssignmentResources(
         AzureProvisioningOptions provisioningOptions,
         IResource resource,
         Dictionary<AzureProvisioningResource, IEnumerable<RoleDefinition>> roleAssignments)
     {
-        var identityResource = new AppIdentityResource($"{resource.Name}-identity")
-        {
-            ProvisioningBuildOptions = provisioningOptions.ProvisioningBuildOptions
-        };
+        var identityResource = resource is AzureUserAssignedIdentityResource existingIdentityResource
+            ? existingIdentityResource
+            : new AzureUserAssignedIdentityResource($"{resource.Name}-identity")
+            {
+                ProvisioningBuildOptions = provisioningOptions.ProvisioningBuildOptions
+            };
 
         var roleAssignmentResources = CreateRoleAssignmentsResources(provisioningOptions, resource, roleAssignments, identityResource);
         return (identityResource, roleAssignmentResources);
@@ -222,7 +254,7 @@ internal sealed class AzureResourcePreparer(
         AzureProvisioningOptions provisioningOptions,
         IResource resource,
         Dictionary<AzureProvisioningResource, IEnumerable<RoleDefinition>> roleAssignments,
-        AppIdentityResource appIdentityResource)
+        AzureUserAssignedIdentityResource appIdentityResource)
     {
         var roleAssignmentResources = new List<AzureBicepResource>();
         foreach (var (targetResource, roles) in roleAssignments)
@@ -251,7 +283,7 @@ internal sealed class AzureResourcePreparer(
         AzureResourceInfrastructure infra,
         AzureProvisioningResource azureResource,
         IEnumerable<RoleDefinition> roles,
-        AppIdentityResource appIdentityResource)
+        AzureUserAssignedIdentityResource appIdentityResource)
     {
         var context = new AddRoleAssignmentsContext(
             infra,

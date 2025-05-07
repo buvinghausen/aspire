@@ -7,6 +7,7 @@ using System.Data;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Channels;
 using Aspire.Dashboard.ConsoleLogs;
@@ -27,7 +28,7 @@ using Polly;
 
 namespace Aspire.Hosting.Dcp;
 
-internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
+internal sealed class DcpExecutor : IDcpExecutor, IConsoleLogsService, IAsyncDisposable
 {
     internal const string DebugSessionPortVar = "DEBUG_SESSION_PORT";
     internal const string DefaultAspireNetworkName = "default-aspire-network";
@@ -129,6 +130,11 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
 
             await CreateContainersAndExecutablesAsync(cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // This is here so hosting does not throw an exception when CTRL+C during startup.
+            _logger.LogDebug("Cancellation received during application startup.");
+        }
         catch
         {
             _shutdownCancellation.Cancel();
@@ -221,6 +227,8 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
                     Task.Run(() => WatchKubernetesResourceAsync<Endpoint>(ProcessEndpointChange))).ConfigureAwait(false);
             }
         });
+
+        _loggerService.SetConsoleLogsService(this);
 
         var watchSubscribersTask = Task.Run(async () =>
         {
@@ -423,12 +431,56 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
         return new(null, null, null);
     }
 
+    public async IAsyncEnumerable<IReadOnlyList<LogEntry>> GetAllLogsAsync(string resourceName, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        IAsyncEnumerable<IReadOnlyList<(string, bool)>>? enumerable = null;
+        if (_resourceState.ContainersMap.TryGetValue(resourceName, out var container))
+        {
+            enumerable = new ResourceLogSource<Container>(_logger, _kubernetesService, container, follow: false);
+        }
+        else if (_resourceState.ExecutablesMap.TryGetValue(resourceName, out var executable))
+        {
+            enumerable = new ResourceLogSource<Executable>(_logger, _kubernetesService, executable, follow: false);
+        }
+
+        if (enumerable != null)
+        {
+            await foreach (var batch in enumerable.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                var logs = new List<LogEntry>();
+                foreach (var logEntry in CreateLogEntries(batch))
+                {
+                    logs.Add(logEntry);
+                }
+
+                yield return logs;
+            }
+        }
+    }
+
+    private static IEnumerable<LogEntry> CreateLogEntries(IReadOnlyList<(string, bool)> batch)
+    {
+        foreach (var (content, isError) in batch)
+        {
+            DateTime? timestamp = null;
+            var resolvedContent = content;
+
+            if (TimestampParser.TryParseConsoleTimestamp(resolvedContent, out var result))
+            {
+                resolvedContent = result.Value.ModifiedText;
+                timestamp = result.Value.Timestamp.UtcDateTime;
+            }
+
+            yield return LogEntry.Create(timestamp, resolvedContent, content, isError);
+        }
+    }
+
     private void StartLogStream<T>(T resource) where T : CustomResource
     {
         IAsyncEnumerable<IReadOnlyList<(string, bool)>>? enumerable = resource switch
         {
-            Container c when c.LogsAvailable => new ResourceLogSource<T>(_logger, _kubernetesService, resource),
-            Executable e when e.LogsAvailable => new ResourceLogSource<T>(_logger, _kubernetesService, resource),
+            Container c when c.LogsAvailable => new ResourceLogSource<T>(_logger, _kubernetesService, resource, follow: true),
+            Executable e when e.LogsAvailable => new ResourceLogSource<T>(_logger, _kubernetesService, resource, follow: true),
             _ => null
         };
 
@@ -458,18 +510,9 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
 
                     await foreach (var batch in enumerable.WithCancellation(cancellation.Token).ConfigureAwait(false))
                     {
-                        foreach (var (content, isError) in batch)
+                        foreach (var logEntry in CreateLogEntries(batch))
                         {
-                            DateTime? timestamp = null;
-                            var resolvedContent = content;
-
-                            if (TimestampParser.TryParseConsoleTimestamp(resolvedContent, out var result))
-                            {
-                                resolvedContent = result.Value.ModifiedText;
-                                timestamp = result.Value.Timestamp.UtcDateTime;
-                            }
-
-                            logger(LogEntry.Create(timestamp, resolvedContent, content, isError));
+                            logger(logEntry);
                         }
                     }
                 }
@@ -902,6 +945,8 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
 
                 try
                 {
+                    await ProcessUrls(resource, cancellationToken).ConfigureAwait(false);
+
                     // Publish snapshots built from DCP resources. Do this now to populate more values from DCP (URLs, source) to ensure they're
                     // available if the resource isn't immediately started because it's waiting or is configured for explicit start.
                     foreach (var er in executables)
@@ -1174,6 +1219,8 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
 
             foreach (var cr in containerResources)
             {
+                await ProcessUrls(cr.ModelResource, cancellationToken).ConfigureAwait(false);
+
                 // Publish snapshot built from DCP resource. Do this now to populate more values from DCP (URLs, source) to ensure they're
                 // available if the resource isn't immediately started because it's waiting or is configured for explicit start.
                 await _executorEvents.PublishAsync(new OnResourceChangedContext(_shutdownCancellation.Token, KnownResourceTypes.Container, cr.ModelResource, cr.DcpResourceName, new ResourceStatus(null, null, null), s => _snapshotBuilder.ToSnapshot((Container)cr.DcpResource, s))).ConfigureAwait(false);
@@ -1406,6 +1453,74 @@ internal sealed class DcpExecutor : IDcpExecutor, IAsyncDisposable
             // We catch and suppress the OperationCancelledException because the user may CTRL-C
             // during start up of the resources.
             _logger.LogDebug(ex, "Cancellation during creation of resources.");
+        }
+    }
+
+    private async Task ProcessUrls(IResource resource, CancellationToken cancellationToken)
+    {
+        // Call the callbacks to configure resource URLs
+
+        if (resource is not IResourceWithEndpoints resourceWithEndpoints)
+        {
+            return;
+        }
+
+        // Project endpoints to URLS
+        var urls = new List<ResourceUrlAnnotation>();
+
+        if (resource.TryGetEndpoints(out var endpoints))
+        {
+            foreach (var endpoint in endpoints)
+            {
+                // Create a URL for each endpoint
+                if (endpoint.AllocatedEndpoint is { } allocatedEndpoint)
+                {
+                    var url = new ResourceUrlAnnotation { Url = allocatedEndpoint.UriString, Endpoint = new EndpointReference(resourceWithEndpoints, endpoint) };
+                    urls.Add(url);
+                }
+            }
+        }
+
+        // Run the URL callbacks
+        if (resource.TryGetAnnotationsOfType<ResourceUrlsCallbackAnnotation>(out var callbacks))
+        {
+            var urlsCallbackContext = new ResourceUrlsCallbackContext(_executionContext, resource, urls, cancellationToken)
+            {
+                Logger = _loggerService.GetLogger(resource.Name)
+            };
+            foreach (var callback in callbacks)
+            {
+                await callback.Callback(urlsCallbackContext).ConfigureAwait(false);
+            }
+        }
+
+        // Clear existing URLs
+        if (resource.TryGetUrls(out var existingUrls))
+        {
+            var existing = existingUrls.ToArray();
+            for (var i = existing.Length - 1; i >= 0; i--)
+            {
+                var url = existing[i];
+                resource.Annotations.Remove(url);
+            }
+        }
+
+        // Convert relative endpoint URLs to absolute URLs
+        foreach (var url in urls)
+        {
+            if (url.Endpoint is { } endpoint)
+            {
+                if (url.Url.StartsWith('/') && endpoint.AllocatedEndpoint is { } allocatedEndpoint)
+                {
+                    url.Url = allocatedEndpoint.UriString.TrimEnd('/') + url.Url;
+                }
+            }
+        }
+
+        // Add URLs
+        foreach (var url in urls)
+        {
+            resource.Annotations.Add(url);
         }
     }
 

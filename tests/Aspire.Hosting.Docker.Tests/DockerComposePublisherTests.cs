@@ -3,14 +3,11 @@
 
 #pragma warning disable ASPIREPUBLISHERS001
 
-using System.Runtime.CompilerServices;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Utils;
 using Aspire.Hosting.Publishing;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
-using Xunit;
+using Aspire.Hosting.Docker.Resources.ComposeNodes;
 
 namespace Aspire.Hosting.Docker.Tests;
 
@@ -21,8 +18,12 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
     {
         using var tempDir = new TempDirectory();
         // Arrange
-        var options = new OptionsMonitor(new DockerComposePublisherOptions { OutputPath = tempDir.Path });
-        var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+
+        var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, publisher: "default", outputPath: tempDir.Path);
+
+        builder.Services.AddSingleton<IResourceContainerImageBuilder, MockImageBuilder>();
+
+        builder.AddDockerComposeEnvironment("docker-compose");
 
         var param0 = builder.AddParameter("param0");
         var param1 = builder.AddParameter("param1", secret: true);
@@ -35,7 +36,8 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
                     .WithArgs("-c", "hello $MSG")
                     .WithEnvironment("MSG", "world");
 
-        var migration = builder.AddContainer("something", "dummy/migration:latest");
+        var migration = builder.AddContainer("something", "dummy/migration:latest")
+                         .WithContainerName("cn");
 
         var api = builder.AddContainer("myapp", "mcr.microsoft.com/dotnet/aspnet:8.0")
                          .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
@@ -57,19 +59,8 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
 
         var app = builder.Build();
 
-        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
-
-        await ExecuteBeforeStartHooksAsync(app, default);
-
-        var publisher = new DockerComposePublisher("test",
-            options,
-            NullLogger<DockerComposePublisher>.Instance,
-            builder.ExecutionContext,
-            new MockImageBuilder()
-            );
-
         // Act
-        await publisher.PublishAsync(model, default);
+        app.Run();
 
         // Assert
         var composePath = Path.Combine(tempDir.Path, "docker-compose.yaml");
@@ -77,91 +68,19 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
         Assert.True(File.Exists(composePath));
         Assert.True(File.Exists(envPath));
 
-        var content = await File.ReadAllTextAsync(composePath);
-        var envContent = await File.ReadAllTextAsync(envPath);
-
-        Assert.Equal(
-            """
-            services:
-              cache:
-                image: "redis:latest"
-                command:
-                  - "-c"
-                  - "hello $$MSG"
-                entrypoint:
-                  - "/bin/sh"
-                environment:
-                  MSG: "world"
-                networks:
-                  - "aspire"
-              something:
-                image: "dummy/migration:latest"
-                networks:
-                  - "aspire"
-              myapp:
-                image: "mcr.microsoft.com/dotnet/aspnet:8.0"
-                command:
-                  - "--cs"
-                  - "Url=${PARAM0}, Secret=${PARAM1}"
-                environment:
-                  ASPNETCORE_ENVIRONMENT: "Development"
-                  PORT: "8000"
-                  param0: "${PARAM0}"
-                  param1: "${PARAM1}"
-                  param2: "${PARAM2}"
-                  ConnectionStrings__cs: "Url=${PARAM0}, Secret=${PARAM1}"
-                ports:
-                  - "8001:8000"
-                depends_on:
-                  cache:
-                    condition: "service_started"
-                  something:
-                    condition: "service_completed_successfully"
-                networks:
-                  - "aspire"
-              project1:
-                image: "${PROJECT1_IMAGE}"
-                environment:
-                  OTEL_DOTNET_EXPERIMENTAL_OTLP_EMIT_EXCEPTION_LOG_ATTRIBUTES: "true"
-                  OTEL_DOTNET_EXPERIMENTAL_OTLP_EMIT_EVENT_LOG_ATTRIBUTES: "true"
-                  OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY: "in_memory"
-                  services__myapp__http__0: "http://myapp:8000"
-                networks:
-                  - "aspire"
-            networks:
-              aspire:
-                driver: "bridge"
-
-            """,
-            content, ignoreAllWhiteSpace: true, ignoreLineEndingDifferences: true);
-
-        Assert.Equal(
-            """
-            # Parameter param0
-            PARAM0=
-
-            # Parameter param1
-            PARAM1=
-
-            # Parameter param2
-            PARAM2=default
-
-            # Container image name for project1
-            PROJECT1_IMAGE=project1:latest
-
-
-            """,
-            envContent, ignoreAllWhiteSpace: true, ignoreLineEndingDifferences: true);
+        await Verify(File.ReadAllText(composePath), "yaml")
+            .AppendContentAsFile(File.ReadAllText(envPath), "env")
+            .UseHelixAwareDirectory();
     }
 
     [Fact]
     public async Task DockerComposeCorrectlyEmitsPortMappings()
     {
         using var tempDir = new TempDirectory();
-        using var builder = TestDistributedApplicationBuilder.Create(["--operation", "publish", "--publisher", "docker-compose", "--output-path", tempDir.Path])
-                                                             .WithTestAndResourceLogging(outputHelper);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, publisher: "default", outputPath: tempDir.Path)
+            .WithTestAndResourceLogging(outputHelper);
 
-        builder.AddDockerComposePublisher();
+        builder.AddDockerComposeEnvironment("docker-compose");
 
         builder.AddContainer("resource", "mcr.microsoft.com/dotnet/aspnet:8.0")
                .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
@@ -174,46 +93,23 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
         var composePath = Path.Combine(tempDir.Path, "docker-compose.yaml");
         Assert.True(File.Exists(composePath));
 
-        var content = await File.ReadAllTextAsync(composePath);
-
-        Assert.Equal(
-            """
-            services:
-              resource:
-                image: "mcr.microsoft.com/dotnet/aspnet:8.0"
-                environment:
-                  ASPNETCORE_ENVIRONMENT: "Development"
-                  HTTP_PORT: "8000"
-                ports:
-                  - "8001:8000"
-                networks:
-                  - "aspire"
-            networks:
-              aspire:
-                driver: "bridge"
-
-            """,
-            content, ignoreAllWhiteSpace: true, ignoreLineEndingDifferences: true);
+        await Verify(File.ReadAllText(composePath), "yaml")
+            .UseHelixAwareDirectory();
     }
 
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task DockerComposeHandleImageBuilding(bool shouldBuildImages)
+    public void DockerComposeHandleImageBuilding(bool shouldBuildImages)
     {
         using var tempDir = new TempDirectory();
-        using var builder = TestDistributedApplicationBuilder.Create(["--operation", "publish", "--publisher", "docker-compose", "--output-path", tempDir.Path])
+        using var builder = TestDistributedApplicationBuilder.Create(["--operation", "publish", "--publisher", "default", "--output-path", tempDir.Path])
             .WithTestAndResourceLogging(outputHelper);
 
-        var options = new OptionsMonitor(new DockerComposePublisherOptions
-        {
-            OutputPath = tempDir.Path,
-            BuildImages = shouldBuildImages,
-        });
+        builder.AddDockerComposeEnvironment("docker-compose")
+               .WithProperties(e => e.BuildContainerImages = shouldBuildImages);
 
-        var mockImageBuilder = new MockImageBuilder();
-
-        builder.AddDockerComposePublisher();
+        builder.Services.AddSingleton<IResourceContainerImageBuilder, MockImageBuilder>();
 
         builder.AddContainer("resource", "mcr.microsoft.com/dotnet/aspnet:8.0")
             .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
@@ -221,27 +117,63 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
 
         var app = builder.Build();
 
-        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var mockImageBuilder = app.Services.GetRequiredService<IResourceContainerImageBuilder>() as MockImageBuilder;
 
-        await ExecuteBeforeStartHooksAsync(app, CancellationToken.None);
-
-        var publisher = new DockerComposePublisher("test",
-            options,
-            NullLogger<DockerComposePublisher>.Instance,
-            builder.ExecutionContext,
-            mockImageBuilder
-        );
+        Assert.NotNull(mockImageBuilder);
 
         // Act
-        await publisher.PublishAsync(model, CancellationToken.None);
+        app.Run();
 
         var composePath = Path.Combine(tempDir.Path, "docker-compose.yaml");
         Assert.True(File.Exists(composePath));
         Assert.Equal(shouldBuildImages, mockImageBuilder.BuildImageCalled);
     }
 
-    [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "ExecuteBeforeStartHooksAsync")]
-    private static extern Task ExecuteBeforeStartHooksAsync(DistributedApplication app, CancellationToken cancellationToken);
+    [Fact]
+    public async Task DockerComposeAppliesServiceCustomizations()
+    {
+        using var tempDir = new TempDirectory();
+        var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, "default", outputPath: tempDir.Path);
+
+        builder.Services.AddSingleton<IResourceContainerImageBuilder, MockImageBuilder>();
+
+        builder.AddDockerComposeEnvironment("docker-compose")
+               .WithProperties(e => e.DefaultNetworkName = "default-network")
+               .ConfigureComposeFile(file =>
+               {
+                   file.AddNetwork(new Network { Name = "custom-network", Driver = "host" });
+
+                   file.Name = "my application";
+               });
+
+        // Add a container to the application
+        var container = builder.AddContainer("service", "nginx")
+            .WithEnvironment("ORIGINAL_ENV", "value")
+            .PublishAsDockerComposeService((serviceResource, composeService) =>
+            {
+                // Add a custom label
+                composeService.Labels["custom-label"] = "test-value";
+
+                // Add a custom environment variable
+                composeService.AddEnvironmentalVariable("CUSTOM_ENV", "custom-value");
+
+                // Set a restart policy
+                composeService.Restart = "always";
+
+                // Add a custom network
+                composeService.Networks.Add("custom-network");
+            });
+
+        var app = builder.Build();
+
+        app.Run();
+        // Assert
+        var composePath = Path.Combine(tempDir.Path, "docker-compose.yaml");
+        Assert.True(File.Exists(composePath));
+
+        await Verify(File.ReadAllText(composePath), "yaml")
+            .UseHelixAwareDirectory();
+    }
 
     private sealed class MockImageBuilder : IResourceContainerImageBuilder
     {
@@ -252,15 +184,6 @@ public class DockerComposePublisherTests(ITestOutputHelper outputHelper)
             BuildImageCalled = true;
             return Task.CompletedTask;
         }
-    }
-
-    private sealed class OptionsMonitor(DockerComposePublisherOptions options) : IOptionsMonitor<DockerComposePublisherOptions>
-    {
-        public DockerComposePublisherOptions Get(string? name) => options;
-
-        public IDisposable OnChange(Action<DockerComposePublisherOptions, string> listener) => null!;
-
-        public DockerComposePublisherOptions CurrentValue => options;
     }
 
     private sealed class TempDirectory : IDisposable

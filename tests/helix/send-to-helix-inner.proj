@@ -60,7 +60,7 @@
   <ItemGroup>
     <_TestBlameArguments Include="--hangdump" />
     <_TestBlameArguments Include="--hangdump-type Full" />
-    <_TestBlameArguments Include="--hangdump-timeout 10m" />
+    <_TestBlameArguments Include="--hangdump-timeout 20m" />
     <_TestBlameArguments Include="--crashdump" />
     <_TestBlameArguments Include="--crashdump-type Full" />
 
@@ -79,6 +79,12 @@
   <ItemGroup>
     <!-- Run this at the start -->
     <HelixPreCommand Include="$(_CleanupProcessesCommand)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <HelixCorrelationPayload Include="$(RepoRoot)tests/Aspire.Hosting.Azure.Tests/Snapshots" Destination="Snapshots" />
+    <HelixCorrelationPayload Include="$(RepoRoot)tests/Aspire.Hosting.Docker.Tests/Snapshots" Destination="Snapshots" />
+    <HelixCorrelationPayload Include="$(RepoRoot)tests/Aspire.Hosting.Kubernetes.Tests/Snapshots" Destination="Snapshots" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(NeedsPlaywright)' == 'true' and '$(DisablePlaywrightTests)' != 'true'">
